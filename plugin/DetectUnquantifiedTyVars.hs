@@ -1,12 +1,14 @@
-{-# LANGUAGE DataKinds #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE KindSignatures #-}
 {-# LANGUAGE TypeApplications #-}
 module DetectUnquantifiedTyVars (plugin) where
 
 -- base
+import Data.Foldable (toList)
 import Data.Coerce (coerce)
+
+-- containers
+import Data.Set (Set)
+import qualified Data.Set as Set
 
 -- ghc
 import qualified GHC
@@ -14,7 +16,8 @@ import qualified GhcPlugins as GHC
 import qualified TcRnMonad as GHC
 
 -- syb
-import Data.Generics (Data, everything, everythingWithContext, mkQ)
+import Data.Generics (Data, everythingWithContext, mkQ)
+
 
 -- * The plugin
 plugin :: GHC.Plugin
@@ -38,105 +41,92 @@ renamerPlugin _cmdLineOpts _modSummary (hsGroup, _, _, _) = do
 
 checkSignature :: GHC.Sig GHC.GhcRn -> GHC.TcM ()
 checkSignature sig =
-    mapM_ warnUnquantified $ getTyVarNames $ findUnquantifieds sig
+    mapM_ warnUnquantified $ unquantifiedTyVarsToList $ findUnquantifieds sig
 
-warnUnquantified :: TyVarName -> GHC.TcM ()
-warnUnquantified tvn =
-    GHC.addWarnAt GHC.NoReason (tyVarNameSrcSpan tvn) $
+warnUnquantified :: UnquantifiedTyVar -> GHC.TcM ()
+warnUnquantified utv =
+    GHC.addWarnAt GHC.NoReason (unquantifiedTyVarSrcSpan utv) $
     GHC.text "Type variable without explicit forall:" GHC.<+>
-    GHC.ppr tvn
+    GHC.ppr utv
 
 -- * Looking for unquantified tyvars in the AST
 
-findUnquantifieds :: Data a => a -> TyVarNames 'Unquantified
+findUnquantifieds :: Data a => a -> UnquantifiedTyVars
 findUnquantifieds =
-    everythingWithContext (emptyTyVarNames @'Quantified) (<>) $
-    mkQ (\quants -> (emptyTyVarNames @'Unquantified, quants)) processType
+    everythingWithContext (mempty @Binders) (<>) $
+    mkQ (\bndrs -> (mempty @UnquantifiedTyVars, bndrs)) processType
   where
     -- Whenever we encounter a type variable that does not occur in the set of
     -- quantified type variables, we return it as an unquantified one.
     --
     -- Whenever we encounter an explicit forall type, we add its binders to
     -- the set of quantified type variables.
-    processType :: GHC.HsType GHC.GhcRn -> TyVarNames 'Quantified
-                -> (TyVarNames 'Unquantified, TyVarNames 'Quantified)
-    processType ty quants
-        | Just name <- hsTypeTyVarName ty
-        , isUnquantified name quants
-        = (unquantified name, quants)
-    processType (GHC.HsForAllTy _ lbndrs _) quants
-        = let newQuants = map (mkTyVarName . fmap GHC.hsTyVarName) lbndrs
-          in  (mempty, addQuantifieds newQuants quants)
-    processType _ quants = (mempty, quants)
+    processType :: GHC.HsType GHC.GhcRn -> Binders
+                -> (UnquantifiedTyVars, Binders)
+    processType (GHC.HsTyVar _ _ lname@(GHC.L _ name)) bndrs
+        | GHC.isTyVarName name
+        , isUnquantified name bndrs
+        = (unitUnquantifiedTyVars $ mkUnquantifiedTyVar lname, bndrs)
+    processType (GHC.HsForAllTy _ lbndrs _) bndrs
+        = let newBndrs = map (mkBinder . GHC.hsTyVarName . GHC.unLoc) lbndrs
+          in  (mempty, addBinders newBndrs bndrs)
+    processType _ bndrs = (mempty, bndrs)
 
-hsTypeTyVarName :: GHC.HsType GHC.GhcRn -> Maybe TyVarName
-hsTypeTyVarName (GHC.HsTyVar _ _ lname@(GHC.L _ name))
-    | GHC.isTyVarName name = Just (mkTyVarName lname)
-hsTypeTyVarName _ = Nothing
+-- | The name of a type variable that occurs as a binder in a forall.
+newtype Binder = Binder (GHC.Name)
+    deriving (Eq, Ord)
 
+mkBinder :: GHC.Name -> Binder
+mkBinder = Binder
 
-newtype TyVarName = TVN { unTVN :: GHC.Located GHC.Name }
-
-instance Eq TyVarName where
-    (==) = coerce (GHC.eqLocated @GHC.Name)
-
-instance Ord TyVarName where
-    compare = coerce (GHC.cmpLocated @GHC.Name)
-
-instance GHC.Outputable TyVarName where
-    ppr = GHC.ppr . GHC.unLoc . unTVN
-
-instance GHC.Uniquable TyVarName where
-    getUnique = GHC.getUnique . GHC.unLoc . unTVN
-
-mkTyVarName :: GHC.Located GHC.Name -> TyVarName
-mkTyVarName = TVN
-
-tyVarNameSrcSpan :: TyVarName -> GHC.SrcSpan
-tyVarNameSrcSpan = GHC.getLoc . unTVN
-
-
--- * Tracking quantified and unquantified type variables
-
--- | A set of type variable names.
---
--- While walking the AST, we need to keep track of a set of quantified tyvars,
--- and also return a set of unquantified tyvars. To avoid confusing these
--- sets, we use 'Quantified' as type index, so the type checker can help us.
-newtype TyVarNames (q :: Quantified) = TyVarNames (GHC.UniqSet TyVarName)
+-- | A collection of all the binders in scope.
+newtype Binders = Binders GHC.NameSet
+    -- A NameSet because we don't care for duplicates nor their ordering,
+    -- remember that when the same type variable occurs in different scopes,
+    -- it will not be equal (thanks to the renamer).
     deriving (Semigroup, Monoid)
 
-data Quantified = Quantified | Unquantified
+addBinders :: [Binder] -> Binders -> Binders
+addBinders = flip (coerce GHC.extendNameSetList)
 
--- | Create an empty 'TyVarNames'.
---
--- Use this in combination with a type application of the desired @q@ instead
--- of 'mempty' to avoid mixing @q@s.
-emptyTyVarNames :: TyVarNames q
-emptyTyVarNames = TyVarNames GHC.emptyUniqSet
+isQuantified :: GHC.Name -> Binders -> Bool
+isQuantified = coerce GHC.elemNameSet
 
-unquantified :: TyVarName -> TyVarNames 'Unquantified
-unquantified = TyVarNames . GHC.unitUniqSet
-
-addQuantifieds :: [TyVarName] -> TyVarNames q -> TyVarNames q
-addQuantifieds = flip (coerce (GHC.addListToUniqSet @TyVarName))
-
-isQuantified :: TyVarName -> TyVarNames 'Quantified -> Bool
-isQuantified = coerce (GHC.elementOfUniqSet @TyVarName)
-
-isUnquantified :: TyVarName -> TyVarNames 'Quantified -> Bool
+isUnquantified :: GHC.Name -> Binders -> Bool
 isUnquantified name = not . isQuantified name
 
-getTyVarNames :: TyVarNames q -> [TyVarName]
-getTyVarNames = coerce (GHC.nonDetEltsUniqSet @TyVarName)
 
--- TODO problem: the warning is for the second occurrence of a instead of
--- the first. Either add all occurrences of the same variable, or make sure
--- the one that occurs first is retained
+-- | The name of a type variable that is not explicitly bound or quantified by
+-- a forall. This includes the precise of the type variable.
+newtype UnquantifiedTyVar = UTV { unUTV :: GHC.Located GHC.Name }
+
+instance Eq UnquantifiedTyVar where
+    (==) = coerce (GHC.eqLocated @GHC.Name)
+
+instance Ord UnquantifiedTyVar where
+    compare = coerce (GHC.cmpLocated @GHC.Name)
+
+instance GHC.Outputable UnquantifiedTyVar where
+    ppr = GHC.ppr . unquantifiedTyVarName
+
+mkUnquantifiedTyVar :: GHC.Located GHC.Name -> UnquantifiedTyVar
+mkUnquantifiedTyVar = UTV
+
+unquantifiedTyVarName :: UnquantifiedTyVar -> GHC.Name
+unquantifiedTyVarName = GHC.unLoc . unUTV
+
+unquantifiedTyVarSrcSpan :: UnquantifiedTyVar -> GHC.SrcSpan
+unquantifiedTyVarSrcSpan = GHC.getLoc . unUTV
+
+-- | A collection of all the unquantified type variables.
 --
---   |
---   | const :: a -> b -> a
---   |               ^
---   |
---   | const :: a -> b -> a
---   |                    ^
+-- A left-biased 'Set' is used, because when a type variable occurs multiple
+-- times in a type signature, we only want to warn about the first occurrence.
+newtype UnquantifiedTyVars = UTVs (Set UnquantifiedTyVar)
+    deriving (Semigroup, Monoid)
+
+unquantifiedTyVarsToList :: UnquantifiedTyVars -> [UnquantifiedTyVar]
+unquantifiedTyVarsToList (UTVs ol) = toList ol
+
+unitUnquantifiedTyVars :: UnquantifiedTyVar -> UnquantifiedTyVars
+unitUnquantifiedTyVars = UTVs . Set.singleton
