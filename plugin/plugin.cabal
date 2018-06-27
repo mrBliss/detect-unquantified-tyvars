@@ -1,0 +1,12 @@
+name: detect-unquantified-tyvars
+cabal-version: >= 1.24
+build-type: Simple
+version: 0.1
+
+library
+  default-language: Haskell2010
+  build-depends: base
+               , ghc
+               , syb
+  exposed-modules: DetectUnquantifiedTyVars
+  ghc-options: -Wall
