@@ -3,8 +3,9 @@
 module DetectUnquantifiedTyVars (plugin) where
 
 -- base
-import Data.Foldable (toList)
+import Control.Monad (forM, forM_)
 import Data.Coerce (coerce)
+import Data.Foldable (toList)
 
 -- containers
 import Data.Set (Set)
@@ -13,6 +14,9 @@ import qualified Data.Set as Set
 -- ghc
 import qualified GHC
 import qualified GhcPlugins as GHC
+import Maybes (orElse)
+import qualified TcEnv as GHC
+import qualified Bag as GHC
 import qualified TcRnMonad as GHC
 
 -- syb
@@ -35,13 +39,34 @@ renamerPlugin _cmdLineOpts _modSummary (hsGroup, _, _, _) = do
     -- TODO hs_tyclds :: [TyClGroup GhcRn]
     case hs_valds of
         GHC.ValBinds {} -> return ()
-        GHC.XValBindsLR (GHC.NValBinds _val_binds sigs) ->
-            mapM_ (checkSignature . GHC.unLoc) sigs
-        -- TODO check pattern/expression/local signatures in val_binds
+        GHC.XValBindsLR (GHC.NValBinds valBindGroups sigs) -> do
+            -- For each signature,
+            namesWithBndrs <- forM sigs $ \sig -> do
+                -- Collect all binders and the unquantified type variables
+                let (unquants, bndrs) = findUnquantifieds mempty sig
+                -- Warn about the unquantified type variables
+                mapM_ warnUnquantified $ unquantifiedTyVarsToList unquants
+                -- Return a mapping from each name that has this signature to
+                -- the binders of the signature
+                return (zip (getTypeSigNames sig) (repeat bndrs))
+            let nameToBndrs :: GHC.Name -> Binders
+                nameToBndrs name = lookup name (concat namesWithBndrs) `orElse` mempty
+                valBindToNames :: GHC.LHsBind GHC.GhcRn -> [GHC.Name]
+                valBindToNames = GHC.collectHsBindBinders . GHC.unLoc
+                valBinds :: [GHC.LHsBind GHC.GhcRn]
+                valBinds = concatMap (GHC.bagToList . snd) valBindGroups
+            -- For each value binding,
+            forM_ valBinds $ \valBind -> do
+                -- Get the binders corresponding with the name(s) of this
+                -- value binding
+                let valBindBndrs = foldMap nameToBndrs $ valBindToNames valBind
+                    (unquants, _) = findUnquantifieds valBindBndrs valBind
+                -- Warn about the unquantified type variables
+                mapM_ warnUnquantified $ unquantifiedTyVarsToList unquants
 
-checkSignature :: GHC.Sig GHC.GhcRn -> GHC.TcM ()
-checkSignature sig =
-    mapM_ warnUnquantified $ unquantifiedTyVarsToList $ findUnquantifieds sig
+
+getTypeSigNames :: GHC.LSig GHC.GhcRn -> [GHC.Name]
+getTypeSigNames = GHC.nameSetElemsStable . GHC.getTypeSigNames . return
 
 warnUnquantified :: UnquantifiedTyVar -> GHC.TcM ()
 warnUnquantified utv =
@@ -51,26 +76,38 @@ warnUnquantified utv =
 
 -- * Looking for unquantified tyvars in the AST
 
-findUnquantifieds :: Data a => a -> UnquantifiedTyVars
-findUnquantifieds =
-    everythingWithContext (mempty @Binders) (<>) $
-    mkQ (\bndrs -> (mempty @UnquantifiedTyVars, bndrs)) processType
+findUnquantifieds :: Data a
+                  => Binders  -- ^ Type variables that are already bound
+                  -> a        -- ^ The thing (type, signature, ...) to walk over
+                  -> (UnquantifiedTyVars, Binders)
+                     -- ^ The unquantified tyvars and all the binders
+                     -- encountered along the way, excluding the initial bounders
+findUnquantifieds initBndrs =
+    everythingWithContext initBndrs (<>) $
+    mkQ (\stateBndrs -> (mempty, stateBndrs)) processType
   where
     -- Whenever we encounter a type variable that does not occur in the set of
     -- quantified type variables, we return it as an unquantified one.
     --
     -- Whenever we encounter an explicit forall type, we add its binders to
     -- the set of quantified type variables.
+    --
+    -- We also collect all the new binders encountered along the way.
     processType :: GHC.HsType GHC.GhcRn -> Binders
-                -> (UnquantifiedTyVars, Binders)
-    processType (GHC.HsTyVar _ _ lname@(GHC.L _ name)) bndrs
+                -> ( (UnquantifiedTyVars, Binders)
+                     -- ^ The unquantified type variables and the new binders
+                   , Binders)
+                     -- ^ The binders that are in scope, including any new ones
+    processType (GHC.HsTyVar _ _ lname@(GHC.L _ name)) stateBndrs
         | GHC.isTyVarName name
-        , isUnquantified name bndrs
-        = (unitUnquantifiedTyVars $ mkUnquantifiedTyVar lname, bndrs)
-    processType (GHC.HsForAllTy _ lbndrs _) bndrs
-        = let newBndrs = map (mkBinder . GHC.hsTyVarName . GHC.unLoc) lbndrs
-          in  (mempty, addBinders newBndrs bndrs)
-    processType _ bndrs = (mempty, bndrs)
+        , isUnquantified name stateBndrs
+        = ((unitUnquantifiedTyVars $ mkUnquantifiedTyVar lname, mempty),
+           stateBndrs)
+    processType (GHC.HsForAllTy _ lbndrs _) stateBndrs
+        = let newBndrs = mkBinders $
+                         map (mkBinder . GHC.hsTyVarName . GHC.unLoc) lbndrs
+          in  ((mempty, newBndrs), newBndrs <> stateBndrs)
+    processType _ stateBndrs = (mempty, stateBndrs)
 
 -- | The name of a type variable that occurs as a binder in a forall.
 newtype Binder = Binder (GHC.Name)
@@ -86,8 +123,8 @@ newtype Binders = Binders GHC.NameSet
     -- it will not be equal (thanks to the renamer).
     deriving (Semigroup, Monoid)
 
-addBinders :: [Binder] -> Binders -> Binders
-addBinders = flip (coerce GHC.extendNameSetList)
+mkBinders :: [Binder] -> Binders
+mkBinders = coerce GHC.mkNameSet
 
 isQuantified :: GHC.Name -> Binders -> Bool
 isQuantified = coerce GHC.elemNameSet
